@@ -1,0 +1,171 @@
+import json
+import os
+import sys
+import unittest
+
+from unittest.mock import patch, mock_open, Mock, MagicMock, call
+
+from telethon import types
+from telethon.errors import FloodWaitError, RPCError
+
+from uploady.client.uploady_client import TelegramUploadClient
+from uploady.exceptions import TelegramUploadDataLoss, MissingFileError
+from uploady.upload_files import File
+
+
+try:
+    from unittest.mock import AsyncMock
+    from unittest import IsolatedAsyncioTestCase
+except ImportError:
+    from asyncmock import AsyncMock
+    from async_case import IsolatedAsyncioTestCase
+
+CONFIG_DATA = {'api_hash': '', 'api_id': ''}
+
+directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), '../../')
+
+
+class AnyArg(object):
+    """https://stackoverflow.com/questions/20428750/pythons-assert-called-with-is-there-a-wildcard-character"""
+    def __eq__(a, b):
+        return True
+
+
+class TestTelegramUploadClient(IsolatedAsyncioTestCase):
+    @patch('builtins.open', mock_open(read_data=json.dumps(CONFIG_DATA)))
+    @patch('uploady.client.uploady_client.TelegramClient.__init__', return_value=None)
+    def setUp(self, m1) -> None:
+        self.upload_file_path = os.path.abspath(os.path.join(directory, 'logo.png'))
+        self.client = TelegramUploadClient(Mock(), Mock(), Mock())
+        self.client.send_file = Mock()
+        self.client.send_file.return_value.media.document.size = os.path.getsize(self.upload_file_path)
+
+    @patch("uploady.client.uploady_client.TelegramUploadClient.forward_messages")
+    def test_forward_to(self, mock_forward_messages: MagicMock):
+        mock_message = MagicMock()
+        mock_destinations = [MagicMock(), MagicMock()]
+        self.client.forward_to(mock_message, mock_destinations)
+        mock_forward_messages.assert_has_calls([
+            call(mock_destinations[0], [mock_message]),
+            call(mock_destinations[1], [mock_message]),
+        ])
+
+    async def test_send_album_media(self):
+        self.client.get_input_entity = AsyncMock()
+        self.client._call = AsyncMock()
+        self.client._sender = MagicMock()
+        self.client._get_response_message = MagicMock()
+        entity = "entity"
+        mock_media = [MagicMock(), MagicMock()]
+        response_message = await self.client._send_album_media(entity, mock_media)
+        self.assertEqual(self.client._get_response_message.return_value, response_message)
+        self.client._get_response_message.assert_called_once_with(
+            [m.random_id for m in mock_media], self.client._call.return_value,
+            self.client.get_input_entity.return_value,
+        )
+
+    @patch('uploady.client.uploady_client.TelegramUploadClient.send_files')
+    @patch('uploady.client.uploady_client.TelegramUploadClient._send_album_media')
+    @unittest.skipIf(sys.version_info < (3, 8), "TypeError: An asyncio.Future, a coroutine or an awaitable is required")
+    def test_send_files_as_album(self, mock_send_album_media: MagicMock, mock_send_files: MagicMock):
+        entity = "entity"
+        mock_files = [MagicMock(), MagicMock()]
+        self.client.send_files_as_album(entity, mock_files)
+        mock_send_files.assert_called_once_with(
+            entity, tuple(mock_files), False, False, (), send_as_media=True
+        )
+        mock_send_album_media.assert_called_once_with(entity, mock_send_files.return_value)
+
+    @patch('uploady.management.default_config')
+    def test_missing_file(self, m1):
+        with self.assertRaises(MissingFileError):
+            self.client.send_files('foo', [])
+
+    def test_one_file(self):
+        with self.subTest("Test send one file"):
+            entity = 'foo'
+            file = File(MagicMock(max_caption_length=200), self.upload_file_path)
+            self.client.send_one_file(entity, file, False, None)
+            self.client.send_file.assert_called_once_with(
+                entity, file, thumb=None, file_size=file.file_size, caption="logo", force_document=False,
+                progress_callback=AnyArg(), attributes=[]
+            )
+        original_send_file_message = self.client._send_file_message
+        with self.subTest("Test send one file with one flood retry"), patch('time.sleep') as mock_sleep:
+            wait = 1
+
+            self.client._send_file_message = MagicMock()
+            self.client._send_file_message.side_effect = [FloodWaitError(None, wait), original_send_file_message]
+            entity = 'foo'
+            file = File(MagicMock(), self.upload_file_path)
+            self.client.send_one_file(entity, file, False, None)
+            self.client._send_file_message.assert_has_calls([call(entity, file, None, AnyArg())] * 2)
+            mock_sleep.assert_called_once_with(wait)
+        with self.subTest("Test send one file with rpcError"):
+            self.client._send_file_message = MagicMock()
+            self.client._send_file_message.side_effect = [RPCError(None, "")] * 4
+            entity = 'foo'
+            file = File(MagicMock(), self.upload_file_path)
+            self.client.send_one_file(entity, file, False, None, 3)
+            self.client._send_file_message.assert_has_calls([call(entity, file, None, AnyArg())] * 3)
+
+    def test_send_files(self):
+        with self.subTest("Test send files"):
+            entity = 'foo'
+            file = File(MagicMock(max_caption_length=200), self.upload_file_path)
+            self.client.send_files(entity, [file])
+            self.client.send_file.assert_called_once_with(
+                entity, file, thumb=None, file_size=file.file_size,
+                caption=os.path.basename(self.upload_file_path).split('.')[0], force_document=False,
+                progress_callback=AnyArg(), attributes=[],
+            )
+        with self.subTest("Test send files with thumb"), \
+                patch.object(File, "get_thumbnail", return_value="thumb.jpg"), \
+                patch('uploady.client.uploady_client.os') as mock_os:
+            mock_os.path.lexists.return_value = True
+            entity = 'foo'
+            file = File(MagicMock(max_caption_length=200), self.upload_file_path)
+            self.client.send_files(entity, [file])
+            self.client.send_file.assert_called_with(
+                entity, file, thumb="thumb.jpg", file_size=file.file_size,
+                caption=os.path.basename(self.upload_file_path).split('.')[0], force_document=False,
+                progress_callback=AnyArg(), attributes=[],
+            )
+            mock_os.remove.assert_called_once_with("thumb.jpg")
+        with self.subTest("Test send files with delete mode"), patch('os.remove') as mock_remove:
+            file = File(MagicMock(max_caption_length=200), self.upload_file_path)
+            self.client.send_files(entity, [file], delete_on_success=True)
+            self.client.send_file.assert_called_with(
+                entity, file, thumb=None, file_size=file.file_size,
+                caption=os.path.basename(self.upload_file_path).split('.')[0], force_document=False,
+                progress_callback=AnyArg(), attributes=[],
+            )
+            mock_remove.assert_called_once_with(self.upload_file_path)
+
+    def test_send_files_data_loss(self):
+        mock_client = MagicMock(max_caption_length=200)
+        file = File(mock_client, self.upload_file_path)
+        self.client.send_file.return_value.media.document.size = 200
+        with self.assertRaises(TelegramUploadDataLoss):
+            self.client.send_files('foo', [file])
+
+    @patch('uploady.client.uploady_client.utils')
+    @unittest.skipIf(sys.version_info < (3, 8), "TypeError: Cannot cast AsyncMock to any kind of InputMedia.")
+    async def test_send_media(self, mock_utils: MagicMock):
+        mock_client = MagicMock(max_caption_length=200)
+        mock_utils.get_appropriated_part_size.return_value = 512
+        self.client.get_input_entity = AsyncMock()
+        self.client._log = AsyncMock()
+        self.client._call = AsyncMock()
+        self.client._sender = MagicMock()
+        entity = 'entity'
+        mock_progress = MagicMock()
+        file = File(mock_client, self.upload_file_path)
+        with patch('uploady.client.uploady_client.isinstance', return_value=True), \
+                self.subTest("Test photo"):
+            await self.client._send_media(entity, file, mock_progress)
+        isinstance_result = {types.InputMediaUploadedPhoto: False, types.InputMediaUploadedDocument: True}
+        with patch('uploady.client.uploady_client.isinstance',
+                   side_effect=lambda obj, target: isinstance_result.get(target, isinstance(obj, target))), \
+                self.subTest("Test Document"):
+            await self.client._send_media(entity, file, mock_progress)
